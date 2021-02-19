@@ -19,16 +19,43 @@
 
 package org.apache.iceberg.spark.extensions;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.AssertHelpers;
+import org.apache.iceberg.DistributionMode;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.util.concurrent.MoreExecutors;
+import org.apache.spark.SparkException;
 import org.apache.spark.sql.AnalysisException;
 import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Encoders;
 import org.apache.spark.sql.Row;
+import org.apache.spark.sql.catalyst.analysis.NoSuchTableException;
+import org.hamcrest.CoreMatchers;
 import org.junit.After;
+import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
+
+import static org.apache.iceberg.TableProperties.MERGE_CARDINALITY_CHECK_ENABLED;
+import static org.apache.iceberg.TableProperties.MERGE_ISOLATION_LEVEL;
+import static org.apache.iceberg.TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES;
+import static org.apache.iceberg.TableProperties.SPLIT_SIZE;
+import static org.apache.iceberg.TableProperties.WRITE_DISTRIBUTION_MODE;
+import static org.apache.spark.sql.functions.lit;
 
 public abstract class TestMerge extends SparkRowLevelOperationsTestBase {
 
@@ -49,6 +76,859 @@ public abstract class TestMerge extends SparkRowLevelOperationsTestBase {
   }
 
   // TODO: add tests for multiple NOT MATCHED clauses when we move to Spark 3.1
+
+  @Test
+  public void testMergeIntoEmptyTargetInsertAllNonMatchingRows() {
+    createAndInitTable("id INT, dep STRING");
+
+    createOrReplaceView("source", "id INT, dep STRING",
+        "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+        "{ \"id\": 2, \"dep\": \"emp-id-2\" }\n" +
+        "{ \"id\": 3, \"dep\": \"emp-id-3\" }");
+
+    sql("MERGE INTO %s AS t USING source AS s " +
+        "ON t.id == s.id " +
+        "WHEN NOT MATCHED THEN " +
+        "  INSERT *", tableName);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(1, "emp-id-1"), // new
+        row(2, "emp-id-2"), // new
+        row(3, "emp-id-3")  // new
+    );
+    assertEquals("Should have expected rows", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+  }
+
+  @Test
+  public void testMergeIntoEmptyTargetInsertOnlyMatchingRows() {
+    createAndInitTable("id INT, dep STRING");
+
+    createOrReplaceView("source", "id INT, dep STRING",
+        "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+        "{ \"id\": 2, \"dep\": \"emp-id-2\" }\n" +
+        "{ \"id\": 3, \"dep\": \"emp-id-3\" }");
+
+    sql("MERGE INTO %s AS t USING source AS s " +
+        "ON t.id == s.id " +
+        "WHEN NOT MATCHED AND (s.id >=2) THEN " +
+        "  INSERT *", tableName);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(2, "emp-id-2"), // new
+        row(3, "emp-id-3")  // new
+    );
+    assertEquals("Should have expected rows", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+  }
+
+  @Test
+  public void testMergeWithOnlyUpdateClause() {
+    createAndInitTable("id INT, dep STRING",
+        "{ \"id\": 1, \"dep\": \"emp-id-one\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-six\" }");
+
+    createOrReplaceView("source", "id INT, dep STRING",
+        "{ \"id\": 2, \"dep\": \"emp-id-2\" }\n" +
+        "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    sql("MERGE INTO %s AS t USING source AS s " +
+        "ON t.id == s.id " +
+        "WHEN MATCHED AND t.id = 1 THEN " +
+        "  UPDATE SET *", tableName);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(1, "emp-id-1"),   // updated
+        row(6, "emp-id-six")  // kept
+    );
+    assertEquals("Should have expected rows", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+  }
+
+  @Test
+  public void testMergeWithOnlyDeleteClause() {
+    createAndInitTable("id INT, dep STRING",
+        "{ \"id\": 1, \"dep\": \"emp-id-one\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    createOrReplaceView("source", "id INT, dep STRING",
+        "{ \"id\": 2, \"dep\": \"emp-id-2\" }\n" +
+        "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    sql("MERGE INTO %s AS t USING source AS s " +
+        "ON t.id == s.id " +
+        "WHEN MATCHED AND t.id = 6 THEN " +
+        "  DELETE", tableName);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(1, "emp-id-one") // kept
+    );
+    assertEquals("Should have expected rows", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+  }
+
+  @Test
+  public void testMergeWithAllCauses() {
+    createAndInitTable("id INT, dep STRING",
+        "{ \"id\": 1, \"dep\": \"emp-id-one\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    createOrReplaceView("source", "id INT, dep STRING",
+        "{ \"id\": 2, \"dep\": \"emp-id-2\" }\n" +
+        "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    sql("MERGE INTO %s AS t USING source AS s " +
+        "ON t.id == s.id " +
+        "WHEN MATCHED AND t.id = 1 THEN " +
+        "  UPDATE SET * " +
+        "WHEN MATCHED AND t.id = 6 THEN " +
+        "  DELETE " +
+        "WHEN NOT MATCHED AND s.id = 2 THEN " +
+        "  INSERT *", tableName);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(1, "emp-id-1"), // updated
+        row(2, "emp-id-2")  // new
+    );
+    assertEquals("Should have expected rows", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+  }
+
+  @Test
+  public void testMergeWithAllCausesWithExplicitColumnSpecification() {
+    createAndInitTable("id INT, dep STRING",
+        "{ \"id\": 1, \"dep\": \"emp-id-one\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    createOrReplaceView("source", "id INT, dep STRING",
+        "{ \"id\": 2, \"dep\": \"emp-id-2\" }\n" +
+        "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    sql("MERGE INTO %s AS t USING source AS s " +
+        "ON t.id == s.id " +
+        "WHEN MATCHED AND t.id = 1 THEN " +
+        "  UPDATE SET t.id = s.id, t.dep = s.dep " +
+        "WHEN MATCHED AND t.id = 6 THEN " +
+        "  DELETE " +
+        "WHEN NOT MATCHED AND s.id = 2 THEN " +
+        "  INSERT (t.id, t.dep) VALUES (s.id, s.dep)", tableName);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(1, "emp-id-1"), // updated
+        row(2, "emp-id-2")  // new
+    );
+    assertEquals("Should have expected rows", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+  }
+
+  @Test
+  public void testMergeWithSourceCTE() {
+    createAndInitTable("id INT, dep STRING",
+        "{ \"id\": 2, \"dep\": \"emp-id-two\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    createOrReplaceView("source", "id INT, dep STRING",
+        "{ \"id\": 2, \"dep\": \"emp-id-3\" }\n" +
+        "{ \"id\": 1, \"dep\": \"emp-id-2\" }\n" +
+        "{ \"id\": 5, \"dep\": \"emp-id-6\" }");
+
+    sql("WITH cte1 AS (SELECT id + 1 AS id, dep FROM source) " +
+        "MERGE INTO %s AS t USING cte1 AS s " +
+        "ON t.id == s.id " +
+        "WHEN MATCHED AND t.id = 2 THEN " +
+        "  UPDATE SET * " +
+        "WHEN MATCHED AND t.id = 6 THEN " +
+        "  DELETE " +
+        "WHEN NOT MATCHED AND s.id = 3 THEN " +
+        "  INSERT *", tableName);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(2, "emp-id-2"), // updated
+        row(3, "emp-id-3")  // new
+    );
+    assertEquals("Should have expected rows", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+  }
+
+  @Test
+  public void testMergeWithSourceFromSetOps() {
+    createAndInitTable("id INT, dep STRING",
+        "{ \"id\": 1, \"dep\": \"emp-id-one\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    createOrReplaceView("source", "id INT, dep STRING",
+        "{ \"id\": 2, \"dep\": \"emp-id-2\" }\n" +
+        "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    String derivedSource =
+        "SELECT * FROM source WHERE id = 2 " +
+        "UNION ALL " +
+        "SELECT * FROM source WHERE id = 1 OR id = 6";
+
+    sql("MERGE INTO %s AS t USING (%s) AS s " +
+        "ON t.id == s.id " +
+        "WHEN MATCHED AND t.id = 1 THEN " +
+        "  UPDATE SET * " +
+        "WHEN MATCHED AND t.id = 6 THEN " +
+        "  DELETE " +
+        "WHEN NOT MATCHED AND s.id = 2 THEN " +
+        "  INSERT *", tableName, derivedSource);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(1, "emp-id-1"), // updated
+        row(2, "emp-id-2")  // new
+    );
+    assertEquals("Should have expected rows", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+  }
+
+  @Test
+  public void testMergeWithMultipleUpdatesForTargetRow() {
+    createAndInitTable("id INT, dep STRING",
+        "{ \"id\": 1, \"dep\": \"emp-id-one\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    createOrReplaceView("source", "id INT, dep STRING",
+        "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+        "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+        "{ \"id\": 2, \"dep\": \"emp-id-2\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    String errorMsg = "a single row from the target table with multiple rows of the source table";
+    AssertHelpers.assertThrows("Should complain non iceberg target table",
+        SparkException.class, errorMsg,
+        () -> {
+          sql("MERGE INTO %s AS t USING source AS s " +
+              "ON t.id == s.id " +
+              "WHEN MATCHED AND t.id = 1 THEN " +
+              "  UPDATE SET * " +
+              "WHEN MATCHED AND t.id = 6 THEN " +
+              "  DELETE " +
+              "WHEN NOT MATCHED AND s.id = 2 THEN " +
+              "  INSERT *", tableName);
+        });
+
+    assertEquals("Target should be unchanged",
+        ImmutableList.of(row(1, "emp-id-one"), row(6, "emp-id-6")),
+        sql("SELECT * FROM %s ORDER BY id ASC NULLS LAST", tableName));
+  }
+
+  @Test
+  public void testMergeWithDisabledCardinalityCheck() {
+    createAndInitTable("id INT, dep STRING",
+        "{ \"id\": 1, \"dep\": \"emp-id-one\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    createOrReplaceView("source", "id INT, dep STRING",
+        "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+         "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+         "{ \"id\": 2, \"dep\": \"emp-id-2\" }\n" +
+         "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    try {
+      // disable the cardinality check
+      sql("ALTER TABLE %s SET TBLPROPERTIES('%s' '%b')", tableName, MERGE_CARDINALITY_CHECK_ENABLED, false);
+
+      sql("MERGE INTO %s AS t USING source AS s " +
+          "ON t.id == s.id " +
+          "WHEN MATCHED AND t.id = 1 THEN " +
+          "  UPDATE SET * " +
+          "WHEN MATCHED AND t.id = 6 THEN " +
+          "  DELETE " +
+          "WHEN NOT MATCHED AND s.id = 2 THEN " +
+          "  INSERT *", tableName);
+    } finally {
+      sql("ALTER TABLE %s SET TBLPROPERTIES('%s' '%b')", tableName, MERGE_CARDINALITY_CHECK_ENABLED, true);
+    }
+
+    assertEquals("Should have expected rows",
+        ImmutableList.of(row(1, "emp-id-1"), row(1, "emp-id-1"), row(2, "emp-id-2")),
+        sql("SELECT * FROM %s ORDER BY id ASC NULLS LAST", tableName));
+  }
+
+  @Test
+  public void testMergeWithUnconditionalDelete() {
+    createAndInitTable("id INT, dep STRING",
+        "{ \"id\": 1, \"dep\": \"emp-id-one\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    createOrReplaceView("source", "id INT, dep STRING",
+        "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+        "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+        "{ \"id\": 2, \"dep\": \"emp-id-2\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    sql("MERGE INTO %s AS t USING source AS s " +
+        "ON t.id == s.id " +
+        "WHEN MATCHED THEN " +
+        "  DELETE " +
+        "WHEN NOT MATCHED AND s.id = 2 THEN " +
+        "  INSERT *", tableName);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(2, "emp-id-2")  // new
+    );
+    assertEquals("Should have expected rows", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+  }
+
+  @Test
+  public void testMergeWithSingleConditionalDelete() {
+    createAndInitTable("id INT, dep STRING",
+        "{ \"id\": 1, \"dep\": \"emp-id-one\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    createOrReplaceView("source", "id INT, dep STRING",
+        "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+        "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+        "{ \"id\": 2, \"dep\": \"emp-id-2\" }\n" +
+        "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+    String errorMsg = "a single row from the target table with multiple rows of the source table";
+    AssertHelpers.assertThrows("Should complain non iceberg target table",
+        SparkException.class, errorMsg,
+        () -> {
+          sql("MERGE INTO %s AS t USING source AS s " +
+              "ON t.id == s.id " +
+              "WHEN MATCHED AND t.id = 1 THEN " +
+              "  DELETE " +
+              "WHEN NOT MATCHED AND s.id = 2 THEN " +
+              "  INSERT *", tableName);
+        });
+
+    assertEquals("Target should be unchanged",
+        ImmutableList.of(row(1, "emp-id-one"), row(6, "emp-id-6")),
+        sql("SELECT * FROM %s ORDER BY id ASC NULLS LAST", tableName));
+  }
+
+  @Test
+  public void testMergeWithIdentityTransform() {
+    for (DistributionMode mode : DistributionMode.values()) {
+      createAndInitTable("id INT, dep STRING");
+      sql("ALTER TABLE %s ADD PARTITION FIELD identity(dep)", tableName);
+      sql("ALTER TABLE %s SET TBLPROPERTIES('%s' '%s')", tableName, WRITE_DISTRIBUTION_MODE, mode.modeName());
+
+      append(tableName,
+          "{ \"id\": 1, \"dep\": \"emp-id-one\" }\n" +
+          "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+      createOrReplaceView("source", "id INT, dep STRING",
+          "{ \"id\": 2, \"dep\": \"emp-id-2\" }\n" +
+          "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+          "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+      sql("MERGE INTO %s AS t USING source AS s " +
+          "ON t.id == s.id " +
+          "WHEN MATCHED AND t.id = 1 THEN " +
+          "  UPDATE SET * " +
+          "WHEN MATCHED AND t.id = 6 THEN " +
+          "  DELETE " +
+          "WHEN NOT MATCHED AND s.id = 2 THEN " +
+          "  INSERT *", tableName);
+
+      ImmutableList<Object[]> expectedRows = ImmutableList.of(
+          row(1, "emp-id-1"), // updated
+          row(2, "emp-id-2")  // new
+      );
+      assertEquals("Should have expected rows", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+
+      removeTables();
+    }
+  }
+
+  @Test
+  public void testMergeWithDaysTransform() {
+    for (DistributionMode mode : DistributionMode.values()) {
+      createAndInitTable("id INT, ts TIMESTAMP");
+      sql("ALTER TABLE %s ADD PARTITION FIELD days(ts)", tableName);
+      sql("ALTER TABLE %s SET TBLPROPERTIES('%s' '%s')", tableName, WRITE_DISTRIBUTION_MODE, mode.modeName());
+
+      append(tableName, "id INT, ts TIMESTAMP",
+          "{ \"id\": 1, \"ts\": \"2000-01-01 00:00:00\" }\n" +
+          "{ \"id\": 6, \"ts\": \"2000-01-06 00:00:00\" }");
+
+      createOrReplaceView("source", "id INT, ts TIMESTAMP",
+          "{ \"id\": 2, \"ts\": \"2001-01-02 00:00:00\" }\n" +
+          "{ \"id\": 1, \"ts\": \"2001-01-01 00:00:00\" }\n" +
+          "{ \"id\": 6, \"ts\": \"2001-01-06 00:00:00\" }");
+
+      sql("MERGE INTO %s AS t USING source AS s " +
+          "ON t.id == s.id " +
+          "WHEN MATCHED AND t.id = 1 THEN " +
+          "  UPDATE SET * " +
+          "WHEN MATCHED AND t.id = 6 THEN " +
+          "  DELETE " +
+          "WHEN NOT MATCHED AND s.id = 2 THEN " +
+          "  INSERT *", tableName);
+
+      ImmutableList<Object[]> expectedRows = ImmutableList.of(
+          row(1, "2001-01-01 00:00:00"), // updated
+          row(2, "2001-01-02 00:00:00")  // new
+      );
+      assertEquals("Should have expected rows",
+          expectedRows,
+          sql("SELECT id, CAST(ts AS STRING) FROM %s ORDER BY id", tableName));
+
+      removeTables();
+    }
+  }
+
+  @Test
+  public void testMergeWithBucketTransform() {
+    for (DistributionMode mode : DistributionMode.values()) {
+      createAndInitTable("id INT, dep STRING");
+      sql("ALTER TABLE %s ADD PARTITION FIELD bucket(2, dep)", tableName);
+      sql("ALTER TABLE %s SET TBLPROPERTIES('%s' '%s')", tableName, WRITE_DISTRIBUTION_MODE, mode.modeName());
+
+      append(tableName,
+          "{ \"id\": 1, \"dep\": \"emp-id-one\" }\n" +
+          "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+      createOrReplaceView("source", "id INT, dep STRING",
+          "{ \"id\": 2, \"dep\": \"emp-id-2\" }\n" +
+          "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+          "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+      sql("MERGE INTO %s AS t USING source AS s " +
+          "ON t.id == s.id " +
+          "WHEN MATCHED AND t.id = 1 THEN " +
+          "  UPDATE SET * " +
+          "WHEN MATCHED AND t.id = 6 THEN " +
+          "  DELETE " +
+          "WHEN NOT MATCHED AND s.id = 2 THEN " +
+          "  INSERT *", tableName);
+
+      ImmutableList<Object[]> expectedRows = ImmutableList.of(
+          row(1, "emp-id-1"), // updated
+          row(2, "emp-id-2")  // new
+      );
+      assertEquals("Should have expected rows", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+
+      removeTables();
+    }
+  }
+
+  @Test
+  public void testMergeWithTruncateTransform() {
+    for (DistributionMode mode : DistributionMode.values()) {
+      createAndInitTable("id INT, dep STRING");
+      sql("ALTER TABLE %s ADD PARTITION FIELD truncate(dep, 2)", tableName);
+      sql("ALTER TABLE %s SET TBLPROPERTIES('%s' '%s')", tableName, WRITE_DISTRIBUTION_MODE, mode.modeName());
+
+      append(tableName,
+          "{ \"id\": 1, \"dep\": \"emp-id-one\" }\n" +
+          "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+      createOrReplaceView("source", "id INT, dep STRING",
+          "{ \"id\": 2, \"dep\": \"emp-id-2\" }\n" +
+          "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+          "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+      sql("MERGE INTO %s AS t USING source AS s " +
+          "ON t.id == s.id " +
+          "WHEN MATCHED AND t.id = 1 THEN " +
+          "  UPDATE SET * " +
+          "WHEN MATCHED AND t.id = 6 THEN " +
+          "  DELETE " +
+          "WHEN NOT MATCHED AND s.id = 2 THEN " +
+          "  INSERT *", tableName);
+
+      ImmutableList<Object[]> expectedRows = ImmutableList.of(
+          row(1, "emp-id-1"), // updated
+          row(2, "emp-id-2")  // new
+      );
+      assertEquals("Should have expected rows", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+
+      removeTables();
+    }
+  }
+
+  @Test
+  public void testMergeIntoPartitionedAndOrderedTable() {
+    for (DistributionMode mode : DistributionMode.values()) {
+      createAndInitTable("id INT, dep STRING");
+      sql("ALTER TABLE %s ADD PARTITION FIELD dep", tableName);
+      sql("ALTER TABLE %s WRITE ORDERED BY (id)", tableName);
+      sql("ALTER TABLE %s SET TBLPROPERTIES('%s' '%s')", tableName, WRITE_DISTRIBUTION_MODE, mode.modeName());
+
+      append(tableName,
+          "{ \"id\": 1, \"dep\": \"emp-id-one\" }\n" +
+          "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+      createOrReplaceView("source", "id INT, dep STRING",
+          "{ \"id\": 2, \"dep\": \"emp-id-2\" }\n" +
+          "{ \"id\": 1, \"dep\": \"emp-id-1\" }\n" +
+          "{ \"id\": 6, \"dep\": \"emp-id-6\" }");
+
+      sql("MERGE INTO %s AS t USING source AS s " +
+          "ON t.id == s.id " +
+          "WHEN MATCHED AND t.id = 1 THEN " +
+          "  UPDATE SET * " +
+          "WHEN MATCHED AND t.id = 6 THEN " +
+          "  DELETE " +
+          "WHEN NOT MATCHED AND s.id = 2 THEN " +
+          "  INSERT *", tableName);
+
+      ImmutableList<Object[]> expectedRows = ImmutableList.of(
+          row(1, "emp-id-1"), // updated
+          row(2, "emp-id-2")  // new
+      );
+      assertEquals("Should have expected rows", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+
+      removeTables();
+    }
+  }
+
+  @Test
+  public void testSelfMerge() {
+    createAndInitTable("id INT, v STRING",
+        "{ \"id\": 1, \"v\": \"v1\" }\n" +
+        "{ \"id\": 2, \"v\": \"v2\" }");
+
+    sql("MERGE INTO %s t USING %s s " +
+        "ON t.id == s.id " +
+        "WHEN MATCHED AND t.id = 1 THEN " +
+        "  UPDATE SET v = 'x' " +
+        "WHEN NOT MATCHED THEN " +
+        "  INSERT *", tableName, tableName);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(1, "x"), // updated
+        row(2, "v2") // kept
+    );
+    assertEquals("Output should match", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+  }
+
+  @Test
+  public void testMergeWithSourceAsSelfSubquery() {
+    createAndInitTable("id INT, v STRING",
+        "{ \"id\": 1, \"v\": \"v1\" }\n" +
+        "{ \"id\": 2, \"v\": \"v2\" }");
+
+    createOrReplaceView("source", Arrays.asList(1, null), Encoders.INT());
+
+    sql("MERGE INTO %s t USING (SELECT id AS value FROM %s r JOIN source ON r.id = source.value) s " +
+        "ON t.id == s.value " +
+        "WHEN MATCHED AND t.id = 1 THEN " +
+        "  UPDATE SET v = 'x' " +
+        "WHEN NOT MATCHED THEN " +
+        "  INSERT (v, id) VALUES ('invalid', -1) ", tableName, tableName);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(1, "x"), // updated
+        row(2, "v2") // kept
+    );
+    assertEquals("Output should match", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+  }
+
+  @Test
+  public synchronized void testMergeWithSerializableIsolation() throws InterruptedException {
+    // cannot run tests with concurrency for Hadoop tables without atomic renames
+    Assume.assumeFalse(catalogName.equalsIgnoreCase("testhadoop"));
+
+    createAndInitTable("id INT, dep STRING");
+    createOrReplaceView("source", Collections.singletonList(1), Encoders.INT());
+
+    sql("ALTER TABLE %s SET TBLPROPERTIES('%s' '%s')", tableName, MERGE_ISOLATION_LEVEL, "serializable");
+
+    ExecutorService executorService = MoreExecutors.getExitingExecutorService(
+        (ThreadPoolExecutor) Executors.newFixedThreadPool(2));
+
+    AtomicInteger barrier = new AtomicInteger(0);
+
+    // merge thread
+    Future<?> mergeFuture = executorService.submit(() -> {
+      for (int numOperations = 0; numOperations < Integer.MAX_VALUE; numOperations++) {
+        while (barrier.get() < numOperations * 2) {
+          sleep(10);
+        }
+        sql("MERGE INTO %s t USING source s " +
+            "ON t.id == s.value " +
+            "WHEN MATCHED THEN " +
+            "  UPDATE SET dep = 'x'", tableName);
+        barrier.incrementAndGet();
+      }
+    });
+
+    // append thread
+    Future<?> appendFuture = executorService.submit(() -> {
+      for (int numOperations = 0; numOperations < Integer.MAX_VALUE; numOperations++) {
+        while (barrier.get() < numOperations * 2) {
+          sleep(10);
+        }
+        sql("INSERT INTO TABLE %s VALUES (1, 'hr')", tableName);
+        barrier.incrementAndGet();
+      }
+    });
+
+    try {
+      mergeFuture.get();
+      Assert.fail("Expected a validation exception");
+    } catch (ExecutionException e) {
+      Throwable sparkException = e.getCause();
+      Assert.assertThat(sparkException, CoreMatchers.instanceOf(SparkException.class));
+      Throwable validationException = sparkException.getCause();
+      Assert.assertThat(validationException, CoreMatchers.instanceOf(ValidationException.class));
+      String errMsg = validationException.getMessage();
+      Assert.assertThat(errMsg, CoreMatchers.containsString("Found conflicting files that can contain"));
+    } finally {
+      appendFuture.cancel(true);
+    }
+
+    executorService.shutdown();
+    Assert.assertTrue("Timeout", executorService.awaitTermination(2, TimeUnit.MINUTES));
+  }
+
+  @Test
+  public synchronized void testMergeWithSnapshotIsolation() throws InterruptedException, ExecutionException {
+    // cannot run tests with concurrency for Hadoop tables without atomic renames
+    Assume.assumeFalse(catalogName.equalsIgnoreCase("testhadoop"));
+
+    createAndInitTable("id INT, dep STRING");
+    createOrReplaceView("source", Collections.singletonList(1), Encoders.INT());
+
+    sql("ALTER TABLE %s SET TBLPROPERTIES('%s' '%s')", tableName, MERGE_ISOLATION_LEVEL, "snapshot");
+
+    ExecutorService executorService = MoreExecutors.getExitingExecutorService(
+        (ThreadPoolExecutor) Executors.newFixedThreadPool(2));
+
+    AtomicInteger barrier = new AtomicInteger(0);
+
+    // merge thread
+    Future<?> mergeFuture = executorService.submit(() -> {
+      for (int numOperations = 0; numOperations < 20; numOperations++) {
+        while (barrier.get() < numOperations * 2) {
+          sleep(10);
+        }
+        sql("MERGE INTO %s t USING source s " +
+            "ON t.id == s.value " +
+            "WHEN MATCHED THEN " +
+            "  UPDATE SET dep = 'x'", tableName);
+        barrier.incrementAndGet();
+      }
+    });
+
+    // append thread
+    Future<?> appendFuture = executorService.submit(() -> {
+      for (int numOperations = 0; numOperations < 20; numOperations++) {
+        while (barrier.get() < numOperations * 2) {
+          sleep(10);
+        }
+        sql("INSERT INTO TABLE %s VALUES (1, 'hr')", tableName);
+        barrier.incrementAndGet();
+      }
+    });
+
+    try {
+      mergeFuture.get();
+    } finally {
+      appendFuture.cancel(true);
+    }
+
+    executorService.shutdown();
+    Assert.assertTrue("Timeout", executorService.awaitTermination(2, TimeUnit.MINUTES));
+  }
+
+  @Test
+  public void testMergeWithExtraColumnsInSource() {
+    createAndInitTable("id INT, v STRING",
+        "{ \"id\": 1, \"v\": \"v1\" }\n" +
+        "{ \"id\": 2, \"v\": \"v2\" }");
+    createOrReplaceView("source",
+        "{ \"id\": 1, \"extra_col\": -1, \"v\": \"v1_1\" }\n" +
+        "{ \"id\": 3, \"extra_col\": -1, \"v\": \"v3\" }\n" +
+        "{ \"id\": 4, \"extra_col\": -1, \"v\": \"v4\" }");
+
+    sql("MERGE INTO %s t USING source " +
+        "ON t.id == source.id " +
+        "WHEN MATCHED THEN " +
+        "  UPDATE SET v = source.v " +
+        "WHEN NOT MATCHED THEN " +
+        "  INSERT (v, id) VALUES (source.v, source.id)", tableName);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(1, "v1_1"), // new
+        row(2, "v2"),   // kept
+        row(3, "v3"),   // new
+        row(4, "v4")    // new
+    );
+    assertEquals("Output should match", expectedRows, sql("SELECT * FROM %s ORDER BY id", tableName));
+  }
+
+  @Test
+  public void testMergeWithNullsInTargetAndSource() {
+    createAndInitTable("id INT, v STRING",
+        "{ \"id\": null, \"v\": \"v1\" }\n" +
+        "{ \"id\": 2, \"v\": \"v2\" }");
+
+    createOrReplaceView("source",
+        "{ \"id\": null, \"v\": \"v1_1\" }\n" +
+        "{ \"id\": 4, \"v\": \"v4\" }");
+
+    sql("MERGE INTO %s t USING source " +
+        "ON t.id == source.id " +
+        "WHEN MATCHED THEN " +
+        "  UPDATE SET v = source.v " +
+        "WHEN NOT MATCHED THEN " +
+        "  INSERT (v, id) VALUES (source.v, source.id)", tableName);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(null, "v1"),   // kept
+        row(null, "v1_1"), // new
+        row(2, "v2"),      // kept
+        row(4, "v4")       // new
+    );
+    assertEquals("Output should match", expectedRows, sql("SELECT * FROM %s ORDER BY v", tableName));
+  }
+
+  @Test
+  public void testMergeWithNullSafeEquals() {
+    createAndInitTable("id INT, v STRING",
+        "{ \"id\": null, \"v\": \"v1\" }\n" +
+        "{ \"id\": 2, \"v\": \"v2\" }");
+
+    createOrReplaceView("source",
+        "{ \"id\": null, \"v\": \"v1_1\" }\n" +
+        "{ \"id\": 4, \"v\": \"v4\" }");
+
+    sql("MERGE INTO %s t USING source " +
+        "ON t.id <=> source.id " +
+        "WHEN MATCHED THEN " +
+        "  UPDATE SET v = source.v " +
+        "WHEN NOT MATCHED THEN " +
+        "  INSERT (v, id) VALUES (source.v, source.id)", tableName);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(null, "v1_1"), // updated
+        row(2, "v2"),      // kept
+        row(4, "v4")       // new
+    );
+    assertEquals("Output should match", expectedRows, sql("SELECT * FROM %s ORDER BY v", tableName));
+  }
+
+  @Test
+  public void testMergeWithNullCondition() {
+    createAndInitTable("id INT, v STRING",
+        "{ \"id\": null, \"v\": \"v1\" }\n" +
+        "{ \"id\": 2, \"v\": \"v2\" }");
+
+    createOrReplaceView("source",
+        "{ \"id\": null, \"v\": \"v1_1\" }\n" +
+        "{ \"id\": 2, \"v\": \"v2_2\" }");
+
+    sql("MERGE INTO %s t USING source " +
+        "ON t.id == source.id AND NULL " +
+        "WHEN MATCHED THEN " +
+        "  UPDATE SET v = source.v " +
+        "WHEN NOT MATCHED THEN " +
+        "  INSERT (v, id) VALUES (source.v, source.id)", tableName);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(null, "v1"),   // kept
+        row(null, "v1_1"), // new
+        row(2, "v2"),      // kept
+        row(2, "v2_2")     // new
+    );
+    assertEquals("Output should match", expectedRows, sql("SELECT * FROM %s ORDER BY v", tableName));
+  }
+
+  @Test
+  public void testMergeWithNullActionConditions() {
+    createAndInitTable("id INT, v STRING",
+        "{ \"id\": 1, \"v\": \"v1\" }\n" +
+        "{ \"id\": 2, \"v\": \"v2\" }");
+
+    createOrReplaceView("source",
+        "{ \"id\": 1, \"v\": \"v1_1\" }\n" +
+        "{ \"id\": 2, \"v\": \"v2_2\" }\n" +
+        "{ \"id\": 3, \"v\": \"v3_3\" }");
+
+    // all conditions are NULL and will never match any rows
+    sql("MERGE INTO %s t USING source " +
+        "ON t.id == source.id " +
+        "WHEN MATCHED AND source.id = 1 AND NULL THEN " +
+        "  UPDATE SET v = source.v " +
+        "WHEN MATCHED AND source.v = 'v1_1' AND NULL THEN " +
+        "  DELETE " +
+        "WHEN NOT MATCHED AND source.id = 3 AND NULL THEN " +
+        "  INSERT (v, id) VALUES (source.v, source.id)", tableName);
+
+    ImmutableList<Object[]> expectedRows1 = ImmutableList.of(
+        row(1, "v1"), // kept
+        row(2, "v2")  // kept
+    );
+    assertEquals("Output should match", expectedRows1, sql("SELECT * FROM %s ORDER BY v", tableName));
+
+    // only the update and insert conditions are NULL
+    sql("MERGE INTO %s t USING source " +
+        "ON t.id == source.id " +
+        "WHEN MATCHED AND source.id = 1 AND NULL THEN " +
+        "  UPDATE SET v = source.v " +
+        "WHEN MATCHED AND source.v = 'v1_1' THEN " +
+        "  DELETE " +
+        "WHEN NOT MATCHED AND source.id = 3 AND NULL THEN " +
+        "  INSERT (v, id) VALUES (source.v, source.id)", tableName);
+
+    ImmutableList<Object[]> expectedRows2 = ImmutableList.of(
+        row(2, "v2") // kept
+    );
+    assertEquals("Output should match", expectedRows2, sql("SELECT * FROM %s ORDER BY v", tableName));
+  }
+
+  @Test
+  public void testMergeWithMultipleMatchingActions() {
+    createAndInitTable("id INT, v STRING",
+        "{ \"id\": 1, \"v\": \"v1\" }\n" +
+        "{ \"id\": 2, \"v\": \"v2\" }");
+
+    createOrReplaceView("source",
+        "{ \"id\": 1, \"v\": \"v1_1\" }\n" +
+        "{ \"id\": 2, \"v\": \"v2_2\" }");
+
+    // the order of match actions is important in this case
+    sql("MERGE INTO %s t USING source " +
+        "ON t.id == source.id " +
+        "WHEN MATCHED AND source.id = 1 THEN " +
+        "  UPDATE SET v = source.v " +
+        "WHEN MATCHED AND source.v = 'v1_1' THEN " +
+        "  DELETE " +
+        "WHEN NOT MATCHED THEN " +
+        "  INSERT (v, id) VALUES (source.v, source.id)", tableName);
+
+    ImmutableList<Object[]> expectedRows = ImmutableList.of(
+        row(1, "v1_1"), // updated (also matches the delete cond but update is first)
+        row(2, "v2")    // kept (matches neither the update nor the delete cond)
+    );
+    assertEquals("Output should match", expectedRows, sql("SELECT * FROM %s ORDER BY v", tableName));
+  }
+
+  @Test
+  public void testMergeWithMultipleRowGroupsParquet() throws NoSuchTableException {
+    Assume.assumeTrue(fileFormat.equalsIgnoreCase("parquet"));
+
+    createAndInitTable("id INT, dep STRING");
+    sql("ALTER TABLE %s ADD PARTITION FIELD dep", tableName);
+
+    sql("ALTER TABLE %s SET TBLPROPERTIES('%s' '%d')", tableName, PARQUET_ROW_GROUP_SIZE_BYTES, 100);
+    sql("ALTER TABLE %s SET TBLPROPERTIES('%s' '%d')", tableName, SPLIT_SIZE, 100);
+
+    createOrReplaceView("source", Collections.singletonList(1), Encoders.INT());
+
+    List<Integer> ids = new ArrayList<>();
+    for (int id = 1; id <= 200; id++) {
+      ids.add(id);
+    }
+    Dataset<Row> df = spark.createDataset(ids, Encoders.INT())
+        .withColumnRenamed("value", "id")
+        .withColumn("dep", lit("hr"));
+    df.coalesce(1).writeTo(tableName).append();
+
+    Assert.assertEquals(200, spark.table(tableName).count());
+
+    // update a record from one of two row groups and copy over the second one
+    sql("MERGE INTO %s t USING source " +
+        "ON t.id == source.value " +
+        "WHEN MATCHED THEN " +
+        "  UPDATE SET dep = 'x'", tableName);
+
+    Assert.assertEquals(200, spark.table(tableName).count());
+  }
 
   @Test
   public void testMergeInsertOnly() {
